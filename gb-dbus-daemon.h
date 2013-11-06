@@ -21,8 +21,6 @@
 
 #include <gio/gio.h>
 
-#include "gb-supervisor.h"
-
 G_BEGIN_DECLS
 
 #define GB_TYPE_DBUS_DAEMON            (gb_dbus_daemon_get_type())
