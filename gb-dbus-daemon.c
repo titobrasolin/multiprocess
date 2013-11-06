@@ -28,8 +28,7 @@ struct _GbDbusDaemonPrivate
 {
   gchar           *address;
   GDBusConnection *connection;
-  GbSupervisor    *supervisor;
-  GPid             pid;
+  GSubprocess     *subprocess;
 };
 
 enum
@@ -37,7 +36,6 @@ enum
   PROP_0,
   PROP_ADDRESS,
   PROP_CONNECTION,
-  PROP_SUPERVISOR,
   LAST_PROP
 };
 
@@ -47,40 +45,6 @@ G_DEFINE_TYPE_WITH_CODE (GbDbusDaemon,
                          G_ADD_PRIVATE (GbDbusDaemon))
 
 static GParamSpec * gParamSpecs[LAST_PROP];
-
-GbDbusDaemon *
-gb_dbus_daemon_new (GbSupervisor *supervisor)
-{
-  return g_object_new (GB_TYPE_DBUS_DAEMON,
-                       "supervisor", supervisor,
-                       NULL);
-}
-
-const gchar *
-gb_dbus_daemon_get_address (GbDbusDaemon *daemon)
-{
-  g_return_val_if_fail (GB_IS_DBUS_DAEMON (daemon), NULL);
-
-  return daemon->priv->address;
-}
-
-GDBusConnection *
-gb_dbus_daemon_get_connection (GbDbusDaemon *daemon)
-{
-  g_return_val_if_fail (GB_IS_DBUS_DAEMON (daemon), NULL);
-
-  return daemon->priv->connection;
-}
-
-static void
-gb_dbus_daemon_set_supervisor (GbDbusDaemon *daemon,
-                               GbSupervisor *supervisor)
-{
-  g_return_if_fail (GB_IS_DBUS_DAEMON (daemon));
-  g_return_if_fail (!supervisor || GB_IS_SUPERVISOR (supervisor));
-
-  daemon->priv->supervisor = supervisor ? g_object_ref (supervisor) : NULL;
-}
 
 static gchar *
 write_config (void)
@@ -129,76 +93,144 @@ write_config (void)
   return tmpl;
 }
 
+static void
+child_setup_func (gpointer user_data)
+{
+  /*
+   * On Linux, tell the bus process to exit if this process goes away.
+   */
+#ifdef __linux
+#include <sys/prctl.h>
+  prctl (PR_SET_PDEATHSIG, 15);
+#endif
+}
+
+static GSubprocess *
+gb_dbus_daemon_launch (GbDbusDaemon  *daemon,
+                       GError       **error)
+{
+  GSubprocessLauncher *launcher;
+  GSubprocess *subprocess;
+  gchar *config_file;
+
+  g_return_if_fail (GB_IS_DBUS_DAEMON(daemon));
+
+  if (!(config_file = write_config ()))
+    {
+      g_set_error (error,
+                   G_FILE_ERROR,
+                   G_FILE_ERROR_IO,
+                   _("Failed to write dbus configuration."));
+      return NULL;
+    }
+
+  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE);
+  g_subprocess_launcher_set_child_setup (launcher,
+                                         child_setup_func,
+                                         NULL,
+                                         NULL);
+
+  subprocess = g_subprocess_launcher_spawn (launcher, error,
+                                            "dbus-daemon",
+                                            "--print-address",
+                                            "--nofork",
+                                            "--nopidfile",
+                                            "--config-file",
+                                            config_file,
+                                            NULL);
+
+  g_free (config_file);
+
+  return subprocess;
+}
+
+static gchar *
+gb_dbus_daemon_read_address (GbDbusDaemon *daemon,
+                             GSubprocess  *subprocess)
+{
+  GDataInputStream *data_stream;
+  GInputStream *raw_stream;
+  gchar *line;
+  gchar *ret = NULL;
+
+  raw_stream = g_subprocess_get_stdout_pipe (subprocess);
+  data_stream = g_data_input_stream_new (raw_stream);
+  line = g_data_input_stream_read_line_utf8 (data_stream, NULL, NULL, NULL);
+
+  if (!line)
+    goto cleanup;
+
+  ret = g_strdup (g_strchomp (line));
+
+cleanup:
+  g_clear_object (&data_stream);
+  g_clear_object (&raw_stream);
+  g_clear_pointer (&line, g_free);
+
+  return ret;
+}
+
+GbDbusDaemon *
+gb_dbus_daemon_new (void)
+{
+  return g_object_new (GB_TYPE_DBUS_DAEMON, NULL);
+}
+
+const gchar *
+gb_dbus_daemon_get_address (GbDbusDaemon *daemon)
+{
+  g_return_val_if_fail (GB_IS_DBUS_DAEMON (daemon), NULL);
+
+  return daemon->priv->address;
+}
+
+GDBusConnection *
+gb_dbus_daemon_get_connection (GbDbusDaemon *daemon)
+{
+  g_return_val_if_fail (GB_IS_DBUS_DAEMON (daemon), NULL);
+
+  return daemon->priv->connection;
+}
+
 void
 gb_dbus_daemon_start (GbDbusDaemon *daemon)
 {
-  static const gchar *argv[] = { "dbus-daemon",
-                                 "--config-file",
-                                 "foo",
-                                 "--print-address",
-                                 "--nofork",
-                                 "--nopidfile",
-                                 NULL };
   GbDbusDaemonPrivate *priv;
-  GDataInputStream *data_stream = NULL;
-  GInputStream *raw_stream;
-  gboolean r;
+  GSubprocess *subprocess;
   GError *error = NULL;
-  gchar *line = NULL;
-  gchar *path = NULL;
-  gint standard_output = -1;
+  gchar *address;
 
   g_return_if_fail (GB_IS_DBUS_DAEMON (daemon));
 
   priv = daemon->priv;
 
-  if (priv->pid)
+  if (priv->subprocess)
     {
-      g_warning ("Cannot launch daemon, it has already been launched.");
+      g_warning ("dbus-daemon has already been launched.");
       return;
     }
 
-  path = write_config ();
-  argv[2] = path;
+  subprocess = gb_dbus_daemon_launch (daemon, &error);
 
-  r = g_spawn_async_with_pipes (NULL,
-                                (gchar **)argv,
-                                NULL,
-                                G_SPAWN_SEARCH_PATH,
-                                NULL,
-                                NULL,
-                                &priv->pid,
-                                NULL,
-                                &standard_output,
-                                NULL,
-                                &error);
-
-  if (!r)
+  if (!subprocess)
     {
-      g_warning ("%s", error->message);
+      g_warning ("Failed to launch dbus-daemon: %s", error->message);
       g_error_free (error);
-      goto cleanup;
+      return;
     }
 
-  gb_supervisor_add_pid (priv->supervisor, priv->pid);
+  address = gb_dbus_daemon_read_address (daemon, subprocess);
 
-  raw_stream = g_unix_input_stream_new (standard_output, TRUE);
-  data_stream = g_data_input_stream_new (raw_stream);
-  g_object_unref (raw_stream);
-
-  line = g_data_input_stream_read_line_utf8 (data_stream, NULL, NULL, &error);
-
-  if (!line)
+  if (!address)
     {
-      kill (priv->pid, SIGTERM);
-      priv->pid = 0;
-      goto cleanup;
+      g_warning ("Failed to parse dbus-daemon address.");
+      g_object_unref (subprocess);
+      return;
     }
 
-  g_clear_pointer (&priv->address, g_free);
-  priv->address = g_strdup (g_strchomp (line));
+  priv->subprocess = subprocess;
+  priv->address = address;
 
-  g_clear_object (&priv->connection);
   priv->connection =
     g_dbus_connection_new_for_address_sync (priv->address,
                                             G_DBUS_CONNECTION_FLAGS_NONE,
@@ -206,24 +238,8 @@ gb_dbus_daemon_start (GbDbusDaemon *daemon)
                                             NULL,
                                             &error);
 
-  if (!priv->connection)
-    {
-      g_warning ("%s", error->message);
-      g_error_free (error);
-      goto cleanup;
-    }
-
-  if (error)
-    {
-      g_warning ("%s", error->message);
-      g_error_free (error);
-      goto cleanup;
-    }
-
-cleanup:
-  g_clear_object (&data_stream);
-  g_clear_pointer (&line, g_free);
-  g_clear_pointer (&path, g_free);
+  g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_ADDRESS]);
+  g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_CONNECTION]);
 }
 
 void
@@ -238,22 +254,14 @@ gb_dbus_daemon_stop (GbDbusDaemon *daemon)
   g_clear_object (&priv->connection);
   g_clear_pointer (&priv->address, g_free);
 
-  if (priv->pid)
+  if (priv->subprocess)
     {
-      kill (priv->pid, SIGTERM);
-      priv->pid = 0;
+      g_subprocess_force_exit (priv->subprocess);
+      g_clear_object (&priv->subprocess);
     }
-}
 
-static void
-gb_dbus_daemon_constructed (GObject *object)
-{
-  GbDbusDaemonPrivate *priv = GB_DBUS_DAEMON (object)->priv;
-
-  if (!priv->supervisor)
-    {
-      priv->supervisor = gb_supervisor_new ();
-    }
+  g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_ADDRESS]);
+  g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_CONNECTION]);
 }
 
 static void
@@ -266,13 +274,11 @@ gb_dbus_daemon_finalize (GObject *object)
   g_clear_object (&priv->connection);
   g_clear_pointer (&priv->address, g_free);
 
-  if (priv->pid)
+  if (priv->subprocess)
     {
-      kill (priv->pid, SIGTERM);
-      priv->pid = 0;
+      g_subprocess_force_exit (priv->subprocess);
+      g_clear_object (&priv->subprocess);
     }
-
-  g_clear_object (&priv->supervisor);
 
   G_OBJECT_CLASS (gb_dbus_daemon_parent_class)->finalize (object);
 }
@@ -298,32 +304,13 @@ gb_dbus_daemon_get_property (GObject    *object,
 }
 
 static void
-gb_dbus_daemon_set_property (GObject      *object,
-                             guint         prop_id,
-                             const GValue *value,
-                             GParamSpec   *pspec)
-{
-  GbDbusDaemon *daemon = GB_DBUS_DAEMON (object);
-
-  switch (prop_id) {
-  case PROP_SUPERVISOR:
-    gb_dbus_daemon_set_supervisor (daemon, g_value_get_object (value));
-    break;
-  default:
-    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-  }
-}
-
-static void
 gb_dbus_daemon_class_init (GbDbusDaemonClass *klass)
 {
   GObjectClass *object_class;
 
   object_class = G_OBJECT_CLASS (klass);
-  object_class->constructed = gb_dbus_daemon_constructed;
   object_class->finalize = gb_dbus_daemon_finalize;
   object_class->get_property = gb_dbus_daemon_get_property;
-  object_class->set_property = gb_dbus_daemon_set_property;
 
   gParamSpecs[PROP_ADDRESS] =
     g_param_spec_string ("address",
@@ -342,17 +329,6 @@ gb_dbus_daemon_class_init (GbDbusDaemonClass *klass)
                          (G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (object_class, PROP_CONNECTION,
                                    gParamSpecs[PROP_CONNECTION]);
-
-  gParamSpecs[PROP_SUPERVISOR] =
-    g_param_spec_object ("supervisor",
-                         _ ("Supervisor"),
-                         _ ("The supervisor of the daemon."),
-                         GB_TYPE_SUPERVISOR,
-                         (G_PARAM_READWRITE |
-                          G_PARAM_CONSTRUCT_ONLY |
-                          G_PARAM_STATIC_STRINGS));
-  g_object_class_install_property (object_class, PROP_SUPERVISOR,
-                                   gParamSpecs[PROP_SUPERVISOR]);
 }
 
 static void

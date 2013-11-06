@@ -55,7 +55,7 @@ main (gint   argc,
       return 1;
     }
 
-  daemon = gb_dbus_daemon_new (supervisor);
+  daemon = gb_dbus_daemon_new ();
 
   for (i = 0; i < 10; i++)
     add_sleep (supervisor, 20);

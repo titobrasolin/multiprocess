@@ -50,7 +50,7 @@ struct _GbDbusDaemonClass
    GObjectClass parent_class;
 };
 
-GbDbusDaemon    *gb_dbus_daemon_new            (GbSupervisor *supervisor);
+GbDbusDaemon    *gb_dbus_daemon_new            (void);
 GType            gb_dbus_daemon_get_type       (void) G_GNUC_CONST;
 GDBusConnection *gb_dbus_daemon_get_connection (GbDbusDaemon *daemon);
 const gchar     *gb_dbus_daemon_get_address    (GbDbusDaemon *daemon);
