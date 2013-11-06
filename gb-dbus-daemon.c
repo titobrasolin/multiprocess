@@ -27,6 +27,7 @@
 struct _GbDbusDaemonPrivate
 {
   gchar           *address;
+  gchar           *config_file;
   GDBusConnection *connection;
   GSubprocess     *subprocess;
 };
@@ -139,7 +140,8 @@ gb_dbus_daemon_launch (GbDbusDaemon  *daemon,
                                             config_file,
                                             NULL);
 
-  g_free (config_file);
+  g_clear_pointer (&daemon->priv->config_file, g_free);
+  daemon->priv->config_file = config_file;
 
   return subprocess;
 }
@@ -238,6 +240,9 @@ gb_dbus_daemon_start (GbDbusDaemon *daemon)
                                             NULL,
                                             &error);
 
+  g_unlink (priv->config_file);
+  g_clear_pointer (&priv->config_file, g_free);
+
   g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_ADDRESS]);
   g_object_notify_by_pspec (G_OBJECT (daemon), gParamSpecs[PROP_CONNECTION]);
 }
@@ -253,6 +258,7 @@ gb_dbus_daemon_stop (GbDbusDaemon *daemon)
 
   g_clear_object (&priv->connection);
   g_clear_pointer (&priv->address, g_free);
+  g_clear_pointer (&priv->config_file, g_free);
 
   if (priv->subprocess)
     {
